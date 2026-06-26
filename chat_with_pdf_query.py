@@ -10,12 +10,14 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.globals import set_llm_cache
-from langchain_couchbase.cache import CouchbaseCache
+from langchain_couchbase.cache import CouchbaseCache, CouchbaseSemanticCache
+import uuid
 import time
 from couchbase.cluster import Cluster
 from couchbase.auth import PasswordAuthenticator
-from couchbase.options import ClusterOptions
+from couchbase.options import ClusterOptions, SearchOptions
+from couchbase.search import SearchRequest
+from couchbase.vector_search import VectorSearch, VectorQuery
 from datetime import timedelta
 
 
@@ -76,15 +78,57 @@ def get_vector_store(
 
 
 @st.cache_resource(show_spinner="Connecting to Cache")
-def get_cache(_cluster, db_bucket, db_scope, cache_collection):
-    """Return the Couchbase cache"""
-    cache = CouchbaseCache(
+def _get_cache(_cluster, db_bucket, db_scope, cache_collection):
+    """Return the Couchbase exact-match cache"""
+    return CouchbaseCache(
         cluster=_cluster,
         bucket_name=db_bucket,
         scope_name=db_scope,
         collection_name=cache_collection,
     )
-    return cache
+
+
+@st.cache_resource(show_spinner="Connecting to Semantic Cache")
+def _get_semantic_cache(_cluster, db_bucket, db_scope, cache_collection, cache_index, _embedding):
+    """Return the Couchbase semantic cache"""
+    return CouchbaseSemanticCache(
+        cluster=_cluster,
+        embedding=_embedding,
+        bucket_name=db_bucket,
+        scope_name=db_scope,
+        collection_name=cache_collection,
+        index_name=cache_index,
+        score_threshold=0.99,
+    )
+
+
+def _lookup_question_cache(question, _cluster, db_bucket, db_scope, cache_collection, cache_index, _embedding, score_threshold=0.9):
+    """Return a cached RAG response if a semantically similar question exists, else None."""
+    try:
+        vector = _embedding.embed_query(question)
+        scope = _cluster.bucket(db_bucket).scope(db_scope)
+        request = SearchRequest.create(
+            VectorSearch.from_vector_query(VectorQuery("embedding", vector, num_candidates=1))
+        )
+        result = scope.search(cache_index, request, SearchOptions(limit=1))
+        for row in result.rows():
+            if row.score >= score_threshold:
+                doc = scope.collection(cache_collection).get(row.id)
+                return doc.content_as[dict].get("response")
+    except Exception:
+        pass
+    return None
+
+
+def _store_question_cache(question, response, _cluster, db_bucket, db_scope, cache_collection, _embedding):
+    """Store a question-response pair in the semantic cache."""
+    vector = _embedding.embed_query(question)
+    collection = _cluster.bucket(db_bucket).scope(db_scope).collection(cache_collection)
+    collection.upsert(str(uuid.uuid4()), {
+        "text": question,
+        "embedding": vector,
+        "response": response,
+    })
 
 
 @st.cache_resource(show_spinner="Connecting to Couchbase")
@@ -146,6 +190,7 @@ if __name__ == "__main__":
         DB_SCOPE = os.getenv("DB_SCOPE")
         DB_COLLECTION = os.getenv("DB_COLLECTION")
         CACHE_COLLECTION = os.getenv("CACHE_COLLECTION")
+        CACHE_INDEX = os.getenv("CACHE_INDEX")
 
         # Ensure that all environment variables are set
         required_env_vars = [
@@ -157,6 +202,7 @@ if __name__ == "__main__":
             "DB_SCOPE",
             "DB_COLLECTION",
             "CACHE_COLLECTION",
+            "CACHE_INDEX",
         ]
         for var in required_env_vars:
             check_environment_variable(var)
@@ -179,10 +225,6 @@ if __name__ == "__main__":
         # Use couchbase vector store as a retriever for RAG
         retriever = vector_store.as_retriever()
 
-        # Set the LLM cache
-        cache = get_cache(cluster, DB_BUCKET, DB_SCOPE, CACHE_COLLECTION)
-        set_llm_cache(cache)
-
         # Build the prompt for the RAG
         template = """You are a helpful bot. If you cannot answer based on the context provided, respond with a generic answer. Answer the question as truthfully as possible using the context below:
         {context}
@@ -192,7 +234,7 @@ if __name__ == "__main__":
         prompt = ChatPromptTemplate.from_template(template)
 
         # Use OpenAI GPT 4 as the LLM for the RAG
-        llm = ChatOpenAI(temperature=0, model="gpt-4-1106-preview", streaming=True)
+        llm = ChatOpenAI(temperature=0, model="gpt-4o", streaming=True)
 
         # RAG chain
         chain = (
@@ -209,7 +251,7 @@ if __name__ == "__main__":
 
         prompt_without_rag = ChatPromptTemplate.from_template(template_without_rag)
 
-        llm_without_rag = ChatOpenAI(model="gpt-4-1106-preview", streaming=True)
+        llm_without_rag = ChatOpenAI(model="gpt-4o", streaming=True, cache=False)
 
         chain_without_rag = (
             {"question": RunnablePassthrough()}
@@ -287,11 +329,15 @@ if __name__ == "__main__":
 
             # Add placeholder for streaming the response
             with st.chat_message("assistant", avatar=couchbase_logo):
-                # Get the response from the RAG & stream it
-                # In order to cache the response, we need to invoke the chain and cache the response locally as OpenAI does not support it yet
-                # Ref: https://github.com/langchain-ai/langchain/issues/9762
-
-                rag_response = chain.invoke(question)
+                # Check semantic cache first — embed the question and search for a similar cached response
+                rag_response = _lookup_question_cache(
+                    question, cluster, DB_BUCKET, DB_SCOPE, CACHE_COLLECTION, CACHE_INDEX, embedding
+                )
+                if rag_response is None:
+                    rag_response = chain.invoke(question)
+                    _store_question_cache(
+                        question, rag_response, cluster, DB_BUCKET, DB_SCOPE, CACHE_COLLECTION, embedding
+                    )
 
                 st.write_stream(stream_string(rag_response))
 
