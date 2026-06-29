@@ -2,14 +2,14 @@
 
 This is a demo app built to chat with your custom PDFs using the vector search capabilities of Couchbase to augment the OpenAI results in a Retrieval-Augmented-Generation (RAG) model.
 
-The demo also caches the LLM responses using [CouchbaseCache](https://couchbase-ecosystem.github.io/langchain-couchbase/langchain_couchbase.html#module-langchain_couchbase.cache ) to avoid repeated calls to the LLMs saving time and cost. You need to specify just the collection (in the same scope and bucket for simplicity) to cache the LLM responses.
+The demo also uses a **question-level semantic cache** backed by Couchbase to avoid repeated LLM calls for semantically similar questions — saving time and cost. On a cache hit, the previous RAG response is returned and streamed directly without calling OpenAI.
 
 ## Two Vector Search Implementations
 
 This demo provides two implementations showcasing different Couchbase vector search approaches:
 
-1. **CouchbaseQueryVectorStore** (`chat_with_pdf_query.py`) - Using Couchbase Vector Search (Hyperscale/Composite Vector Indexes) with the Query and Indexing Services.
-2. **CouchbaseSearchVectorStore** (`chat_with_pdf.py`) - Using Couchbase Search (formerly known as Full Text Search) Service.
+1. **CouchbaseQueryVectorStore** (`chat_with_pdf_query.py`) - Using Couchbase Vector Search (Hyperscale/Composite Vector Indexes) with the Query and Indexing Services. Includes a question-level semantic cache backed by a Couchbase FTS vector index.
+2. **CouchbaseSearchVectorStore** (`chat_with_pdf.py`) - Using Couchbase Search (formerly known as Full Text Search) Service. Uses exact-match `CouchbaseCache`.
 
 
 ### How does it work?
@@ -23,9 +23,9 @@ For each question, you will get two answers:
 
 For RAG, we are using LangChain, Couchbase Vector Search & OpenAI. We fetch parts of the PDF relevant to the question using Vector search & add it as the context to the LLM. The LLM is instructed to answer based on the context from the Vector Store.
 
-All LLM responses are cached in the collection specified. If the same exact question is asked again, the results are fetched from the Cache instead of calling the LLM.
+**Semantic Cache (`chat_with_pdf_query.py`):** RAG responses are cached at the question level. The user's question is embedded and compared against previously cached questions using Couchbase FTS vector search. If a semantically similar question is found (score ≥ 0.9), the cached response is returned immediately. Otherwise, the RAG chain is invoked and the response is stored for future reuse.
 
-> Note: The streaming of Cached responses is purely for visual experience as OpenAI integration cannot stream responses from the Cache due to a known [issue](https://github.com/langchain-ai/langchain/issues/9762).
+> Note: The streaming of cached responses is purely for visual experience — the response is streamed character-by-character from the local string without calling OpenAI.
 
 
 
@@ -49,6 +49,7 @@ DB_BUCKET = "<name_of_bucket_to_store_documents>"
 DB_SCOPE = "<name_of_scope_to_store_documents>"
 DB_COLLECTION = "<name_of_collection_to_store_documents>"
 CACHE_COLLECTION = "<name_of_collection_to_cache_llm_responses>"
+CACHE_INDEX = "<name_of_fts_index_for_semantic_cache>"
 AUTH_ENABLED = "False"
 LOGIN_PASSWORD = "<password_to_access_the_streamlit_app>"
 ```
@@ -68,7 +69,7 @@ AUTH_ENABLED = "False"
 LOGIN_PASSWORD = "<password_to_access_the_streamlit_app>"
 ```
 
-> **Note:** Couchbase Vector Search approach does not require `INDEX_NAME` parameter.
+> **Note:** `CACHE_INDEX` is required only for the Query/GSI approach. `INDEX_NAME` is required only for the FTS approach.
 
 
 
@@ -89,7 +90,7 @@ Couchbase offers different types of vector indexes for Couchbase Vector Search:
 - Best for pure vector searches - content discovery, recommendations, semantic search
 - High performance with low memory footprint - designed to scale to billions of vectors
 - Optimized for concurrent operations - supports simultaneous searches and inserts
-- Use when: You primarily perform vector-only queries without complex scalar filtering
+- Use when: You primarily perform pure vector-only queries without complex scalar filtering
 - Ideal for: Large-scale semantic search, recommendation systems, content discovery
 
 **Composite Vector Indexes**
@@ -155,6 +156,113 @@ The `description` parameter controls how Couchbase optimizes vector storage and 
 For detailed configuration options, see the [Quantization & Centroid Settings](https://docs.couchbase.com/server/current/vector-index/hyperscale-vector-index.html#algo_settings).
 
 > **Note:** In Couchbase Vector Search, the distance represents the vector distance between the query and document embeddings. Lower distance indicates higher similarity, while higher distance indicates lower similarity. This demo uses cosine similarity for measuring document relevance.
+
+### Create the Semantic Cache FTS Index
+
+The `chat_with_pdf_query.py` application requires a Couchbase FTS (Search) index on the cache collection to power the question-level semantic cache. This index enables vector similarity search over cached questions so that semantically equivalent follow-up questions are served from cache instead of calling OpenAI again.
+
+The index should be created on the **cache collection** (e.g., `pdf-docs` → `shared` → `cached_llm_responses`). Each cached document has the following structure:
+
+```json
+{
+  "text": "<original question>",
+  "embedding": [/* 1536-dimensional OpenAI embedding vector */],
+  "response": "<RAG response string>"
+}
+```
+
+#### Import the index via Couchbase UI
+
+- [Couchbase Capella](https://docs.couchbase.com/cloud/search/import-search-index.html)
+
+  - Copy the index definition below to a new file `cache_index.json`
+  - Import the file in Capella using the instructions in the documentation.
+  - Click on **Create Index** to create the index.
+
+- [Couchbase Server](https://docs.couchbase.com/server/current/search/import-search-index.html)
+
+  - Click on **Search** → **Add Index** → **Import**
+  - Paste the following index definition in the Import screen
+  - Click on **Create Index** to create the index.
+
+#### Index Definition
+
+Update `sourceName`, `shared.cached_llm_responses`, and `CACHE_INDEX` in `secrets.toml` to match your bucket name, scope, and collection if they differ from the defaults below.
+
+```json
+{
+  "name": "cached_llm_responses_index",
+  "type": "fulltext-index",
+  "params": {
+    "doc_config": {
+      "docid_prefix_delim": "",
+      "docid_regexp": "",
+      "mode": "scope.collection.type_field",
+      "type_field": "type"
+    },
+    "mapping": {
+      "default_analyzer": "standard",
+      "default_datetime_parser": "dateTimeOptional",
+      "default_field": "_all",
+      "default_mapping": {
+        "dynamic": true,
+        "enabled": false
+      },
+      "default_type": "_default",
+      "docvalues_dynamic": false,
+      "index_dynamic": true,
+      "store_dynamic": false,
+      "type_field": "_type",
+      "types": {
+        "shared.cached_llm_responses": {
+          "dynamic": true,
+          "enabled": true,
+          "properties": {
+            "embedding": {
+              "enabled": true,
+              "dynamic": false,
+              "fields": [
+                {
+                  "dims": 1536,
+                  "index": true,
+                  "name": "embedding",
+                  "similarity": "dot_product",
+                  "type": "vector",
+                  "vector_index_optimized_for": "recall"
+                }
+              ]
+            },
+            "text": {
+              "enabled": true,
+              "dynamic": false,
+              "fields": [
+                {
+                  "index": true,
+                  "name": "text",
+                  "store": true,
+                  "type": "text"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "store": {
+      "indexType": "scorch",
+      "segmentVersion": 16
+    }
+  },
+  "sourceType": "gocbcore",
+  "sourceName": "pdf-docs",
+  "sourceParams": {},
+  "planParams": {
+    "maxPartitionsPerPIndex": 64,
+    "indexPartitions": 16,
+    "numReplicas": 0
+  }
+}
+```
 
 ### Run the Couchbase Vector Search application
 
