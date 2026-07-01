@@ -2,15 +2,9 @@
 
 This is a demo app built to chat with your custom PDFs using the vector search capabilities of Couchbase to augment the OpenAI results in a Retrieval-Augmented-Generation (RAG) model.
 
+The demo uses `CouchbaseQueryVectorStore` (`chat_with_pdf_query.py`), which leverages Couchbase Vector Search (Hyperscale/Composite Vector Indexes) with the Query and Indexing Services.
+
 The demo also uses a **question-level semantic cache** backed by Couchbase to avoid repeated LLM calls for semantically similar questions — saving time and cost. On a cache hit, the previous RAG response is returned and streamed directly without calling OpenAI.
-
-## Two Vector Search Implementations
-
-This demo provides two implementations showcasing different Couchbase vector search approaches:
-
-1. **CouchbaseQueryVectorStore** (`chat_with_pdf_query.py`) - Using Couchbase Vector Search (Hyperscale/Composite Vector Indexes) with the Query and Indexing Services. Includes a question-level semantic cache backed by a Couchbase FTS vector index.
-2. **CouchbaseSearchVectorStore** (`chat_with_pdf.py`) - Using Couchbase Search (formerly known as Full Text Search) Service. Uses exact-match `CouchbaseCache`.
-
 
 ### How does it work?
 
@@ -23,7 +17,7 @@ For each question, you will get two answers:
 
 For RAG, we are using LangChain, Couchbase Vector Search & OpenAI. We fetch parts of the PDF relevant to the question using Vector search & add it as the context to the LLM. The LLM is instructed to answer based on the context from the Vector Store.
 
-**Semantic Cache (`chat_with_pdf_query.py`):** RAG responses are cached at the question level. The user's question is embedded and compared against previously cached questions using Couchbase FTS vector search. If a semantically similar question is found (score ≥ 0.9), the cached response is returned immediately. Otherwise, the RAG chain is invoked and the response is stored for future reuse.
+**Semantic Cache:** RAG responses are cached at the question level. The user's question is embedded and compared against previously cached questions using Couchbase FTS vector search. If a semantically similar question is found (score ≥ 0.9), the cached response is returned immediately. Otherwise, the RAG chain is invoked and the response is stored for future reuse.
 
 > Note: The streaming of cached responses is purely for visual experience — the response is streamed character-by-character from the local string without calling OpenAI.
 
@@ -39,7 +33,6 @@ For RAG, we are using LangChain, Couchbase Vector Search & OpenAI. We fetch part
 
 Copy the `secrets.example.toml` file in `.streamlit` folder and rename it to `secrets.toml` and replace the placeholders with the actual values for your environment.
 
-**For Couchbase Vector Search - Hyperscale/Composite (`chat_with_pdf_query.py`):**
 ```toml
 OPENAI_API_KEY = "<open_ai_api_key>"
 DB_CONN_STR = "<connection_string_for_couchbase_cluster>"
@@ -54,26 +47,79 @@ AUTH_ENABLED = "False"
 LOGIN_PASSWORD = "<password_to_access_the_streamlit_app>"
 ```
 
-**For Couchbase Search (`chat_with_pdf.py`):**
-```toml
-OPENAI_API_KEY = "<open_ai_api_key>"
-DB_CONN_STR = "<connection_string_for_couchbase_cluster>"
-DB_USERNAME = "<username_for_couchbase_cluster>"
-DB_PASSWORD = "<password_for_couchbase_cluster>"
-DB_BUCKET = "<name_of_bucket_to_store_documents>"
-DB_SCOPE = "<name_of_scope_to_store_documents>"
-DB_COLLECTION = "<name_of_collection_to_store_documents>"
-CACHE_COLLECTION = "<name_of_collection_to_cache_llm_responses>"
-INDEX_NAME = "<name_of_search_index_with_vector_support>"
-AUTH_ENABLED = "False"
-LOGIN_PASSWORD = "<password_to_access_the_streamlit_app>"
+
+
+## Couchbase Bucket, Scope, and Collection Setup
+
+### Bucket, Scope, and Collection Structure
+
+This demo organizes data using one bucket, one scope, and two collections:
+
+```
+pdf-docs (bucket)
+└── shared (scope)
+    ├── docs                    (collection — PDF chunks + embeddings)
+    └── cached_llm_responses    (collection — cached question/response pairs)
 ```
 
-> **Note:** `CACHE_INDEX` is required only for the Query/GSI approach. `INDEX_NAME` is required only for the FTS approach.
+- **`docs`** — Each document is a chunk of an uploaded PDF, stored by `CouchbaseQueryVectorStore` with its text, embedding vector, and metadata (e.g. source file, page number).
+- **`cached_llm_responses`** — Each document is a cached question/answer pair used by the semantic cache, with the following structure:
+
+  ```json
+  {
+    "text": "<original question>",
+    "embedding": [/* 1536-dimensional OpenAI embedding vector */],
+    "response": "<RAG response string>"
+  }
+  ```
+
+The bucket, scope, and collection names above are just the defaults used in this demo — you can name them whatever you like, as long as the names match the `DB_BUCKET`, `DB_SCOPE`, `DB_COLLECTION`, and `CACHE_COLLECTION` values in your `secrets.toml`.
+
+<!-- SCREENSHOT: Couchbase UI showing the "pdf-docs" bucket with the "shared" scope and its "docs" / "cached_llm_responses" collections -->
+
+### Creating the Bucket, Scope, and Collections
+
+**Couchbase Capella:**
+
+1. Open your cluster and go to the **Buckets** tab → **Create Bucket** → name it `pdf-docs` (set the memory quota as needed) → **Create**.
+2. Click into the `pdf-docs` bucket → **Scopes & Collections** → **Add Scope** → name it `shared`.
+3. Within the `shared` scope, **Add Collection** → name it `docs`.
+4. **Add Collection** again → name it `cached_llm_responses`.
+
+**Couchbase Server (self-managed):**
+
+1. Open the Couchbase Web Console → **Buckets** → **Add Bucket** → name it `pdf-docs` (set the memory quota as needed) → **Add Bucket**.
+2. Go to the bucket → **Scopes & Collections** → **Add Scope** → name it `shared`.
+3. Within the `shared` scope, **Add Collection** → name it `docs`.
+4. **Add Collection** again → name it `cached_llm_responses`.
+
+<!-- SCREENSHOT: "Create Bucket" dialog -->
+<!-- SCREENSHOT: "Add Scope" dialog showing "shared" -->
+<!-- SCREENSHOT: "Add Collection" dialog showing "docs" and "cached_llm_responses" -->
+
+### Example Configuration Values
+
+Using the structure above, a filled-in `secrets.toml` would look like this:
+
+```toml
+OPENAI_API_KEY = "sk-<your-openai-api-key>"
+DB_CONN_STR = "couchbases://cb.xxxxxxxx.cloud.couchbase.com"
+DB_USERNAME = "rag-demo-user"
+DB_PASSWORD = "<your-couchbase-password>"
+DB_BUCKET = "pdf-docs"
+DB_SCOPE = "shared"
+DB_COLLECTION = "docs"
+CACHE_COLLECTION = "cached_llm_responses"
+CACHE_INDEX = "cached_llm_responses_index"
+AUTH_ENABLED = "False"
+LOGIN_PASSWORD = "changeme"
+```
+
+`CACHE_INDEX` (`cached_llm_responses_index` above) refers to the FTS index created in [Create the Semantic Cache FTS Index](#create-the-semantic-cache-fts-index) — it is a name you choose when you create that index, not a collection.
 
 
 
-## Approach 1: Couchbase Vector Search (Hyperscale/Composite)
+## Couchbase Vector Search (Hyperscale/Composite)
 
 For the full tutorial on Couchbase Vector Search approach, please visit [Developer Portal - Couchbase Vector Search](https://developer.couchbase.com/tutorial-python-langchain-pdf-chat-query).
 
@@ -159,7 +205,7 @@ For detailed configuration options, see the [Quantization & Centroid Settings](h
 
 ### Create the Semantic Cache FTS Index
 
-The `chat_with_pdf_query.py` application requires a Couchbase FTS (Search) index on the cache collection to power the question-level semantic cache. This index enables vector similarity search over cached questions so that semantically equivalent follow-up questions are served from cache instead of calling OpenAI again.
+The application requires a Couchbase FTS (Search) index on the cache collection to power the question-level semantic cache. This index enables vector similarity search over cached questions so that semantically equivalent follow-up questions are served from cache instead of calling OpenAI again.
 
 The index should be created on the **cache collection** (e.g., `pdf-docs` → `shared` → `cached_llm_responses`). Each cached document has the following structure:
 
@@ -264,117 +310,8 @@ Update `sourceName`, `shared.cached_llm_responses`, and `CACHE_INDEX` in `secret
 }
 ```
 
-### Run the Couchbase Vector Search application
+### Run the Application
 
 ```bash
 streamlit run chat_with_pdf_query.py
-```
-
-
-## Approach 2: Couchbase Search
-
-For the full tutorial on Couchbase Search approach, please visit [Developer Portal - Couchbase Search](https://developer.couchbase.com/tutorial-python-langchain-pdf-chat).
-
-### Prerequisites
-- Couchbase Server 7.6+ or Couchbase Capella
-
-### Create the Search Index
-
-We need to create the Search Index in Couchbase. For this demo, you can import the following index using the instructions.
-
-- [Couchbase Capella](https://docs.couchbase.com/cloud/search/import-search-index.html)
-
-  - Copy the index definition to a new file index.json
-  - Import the file in Capella using the instructions in the documentation.
-  - Click on Create Index to create the index.
-
-- [Couchbase Server](https://docs.couchbase.com/server/current/search/import-search-index.html)
-
-  - Click on Search -> Add Index -> Import
-  - Copy the following Index definition in the Import screen
-  - Click on Create Index to create the index.
-
-#### Index Definition
-
-Here, we are creating the index `pdf_search` on the documents in the `docs` collection within the `shared` scope in the bucket `pdf-docs`. The Vector field is set to `embedding` with 1536 dimensions and the text field set to `text`. We are also indexing and storing all the fields under `metadata` in the document as a dynamic mapping to account for varying document structures. The similarity metric is set to `dot_product`. If there is a change in these parameters, please adapt the index accordingly.
-
-```json
-{
-  "name": "pdf_search",
-  "type": "fulltext-index",
-  "params": {
-      "doc_config": {
-          "docid_prefix_delim": "",
-          "docid_regexp": "",
-          "mode": "scope.collection.type_field",
-          "type_field": "type"
-      },
-      "mapping": {
-          "default_analyzer": "standard",
-          "default_datetime_parser": "dateTimeOptional",
-          "default_field": "_all",
-          "default_mapping": {
-              "dynamic": true,
-              "enabled": false
-          },
-          "default_type": "_default",
-          "docvalues_dynamic": false,
-          "index_dynamic": true,
-          "store_dynamic": false,
-          "type_field": "_type",
-          "types": {
-              "shared.docs": {
-                  "dynamic": true,
-                  "enabled": true,
-                  "properties": {
-                      "embedding": {
-                          "enabled": true,
-                          "dynamic": false,
-                          "fields": [
-                              {
-                                  "dims": 1536,
-                                  "index": true,
-                                  "name": "embedding",
-                                  "similarity": "dot_product",
-                                  "type": "vector",
-                                  "vector_index_optimized_for": "recall"
-                              }
-                          ]
-                      },
-                      "text": {
-                          "enabled": true,
-                          "dynamic": false,
-                          "fields": [
-                              {
-                                  "index": true,
-                                  "name": "text",
-                                  "store": true,
-                                  "type": "text"
-                              }
-                          ]
-                      }
-                  }
-              }
-          }
-      },
-      "store": {
-          "indexType": "scorch",
-          "segmentVersion": 16
-      }
-  },
-  "sourceType": "gocbcore",
-  "sourceName": "pdf-docs",
-  "sourceParams": {},
-  "planParams": {
-      "maxPartitionsPerPIndex": 64,
-      "indexPartitions": 16,
-      "numReplicas": 0
-  }
-}
-```
-
-### Run the Couchbase Search application
-
-```bash
-streamlit run chat_with_pdf.py
 ```
